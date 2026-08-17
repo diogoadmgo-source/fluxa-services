@@ -11,7 +11,9 @@ import { progress, type Job } from "../lib/jobs.js";
  * Por isso o projetor soma TRÊS fontes:
  *   1. tax_out dos recebíveis já emitidos e ainda não pagos, na data esperada;
  *   2. tax_out PROJETADO pelo run-rate das vendas (média semanal dos últimos 90 dias);
- *   3. credit_in das compras, com retorno em 150–180 dias.
+ *   3. credit_in das compras, com retorno em 150–180 dias;
+ *   4. provision mensal — reserva sugerida, que NÃO entra no cálculo do buraco
+ *      (é conselho de gestão, não movimento de caixa).
  * A confiança cai conforme a data se afasta — é o que alimenta a banda do gráfico.
  */
 const HORIZON_DAYS = 120;
@@ -92,7 +94,29 @@ export async function projectCash(job: Job) {
     });
   }
 
-  await progress(job.id, 80, "Gravando eventos");
+  await progress(job.id, 75, "Calculando provisão mensal sugerida");
+
+  // Fonte 4: provisão mensal. É o valor que a empresa deveria separar por mês para
+  // não ser pega de surpresa pelo split. Sem isto o card "Provisão sugerida" fica zerado.
+  const byMonth = new Map<string, number>();
+  for (const e of events) {
+    if ((e as any).kind !== "tax_out") continue;
+    const m = String((e as any).event_date).slice(0, 7);
+    byMonth.set(m, (byMonth.get(m) ?? 0) + Number((e as any).amount_cents));
+  }
+  for (const [month, taxTotal] of byMonth) {
+    // Data da provisão: dia 1º do mês, EXCETO no mês corrente já em curso —
+    // nesse caso vale hoje, senão ela cai fora do horizonte e o card zera.
+    const firstDay = `${month}-01`;
+    const when = firstDay < iso(today) ? iso(today) : firstDay;
+    events.push({
+      tenant_id: tenant, event_date: when, kind: "provision",
+      amount_cents: Math.round(taxTotal / 4),   // reserva semanal equivalente
+      confidence: 0.8, rule_version_id: ruleId,
+    });
+  }
+
+  await progress(job.id, 85, "Gravando eventos");
 
   // Substituição atômica do horizonte: apaga e reescreve, nunca acumula duplicado.
   const { error: e4 } = await db.from("tax_cash_events")
@@ -106,9 +130,19 @@ export async function projectCash(job: Job) {
 
   await db.rpc("refresh_cash_timeline");
 
+  // provisão é sugestão de reserva, não movimento de caixa: fica fora do gap
   const gap30 = events
-    .filter((e: any) => e.event_date <= iso(new Date(today.getTime() + 30 * 864e5)))
+    .filter((e: any) => e.kind !== "provision" && e.event_date <= iso(new Date(today.getTime() + 30 * 864e5)))
     .reduce((s, e: any) => s + (e.kind === "tax_out" ? -e.amount_cents : e.amount_cents), 0);
 
-  return { events: events.length, weekly_run_rate_cents: weeklyTax, gap_30_cents: gap30 };
+  const provision = events
+    .filter((e: any) => e.kind === "provision")
+    .reduce((s, e: any) => s + Number(e.amount_cents), 0);
+
+  return {
+    events: events.length,
+    weekly_run_rate_cents: weeklyTax,
+    gap_30_cents: gap30,
+    provision_cents: provision,
+  };
 }
