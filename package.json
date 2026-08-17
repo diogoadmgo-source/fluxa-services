@@ -1,0 +1,27 @@
+{
+  "name": "fluxa-services",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Workers do FLUXA/TECH-IVA: ingestao DF-e, classificacao de cadeia, calculadora RTC, projecao de caixa",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "run:once": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "fast-xml-parser": "^4.4.1",
+    "pino": "^9.3.2",
+    "undici": "^6.19.8",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}

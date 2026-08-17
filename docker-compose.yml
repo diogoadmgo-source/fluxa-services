@@ -1,0 +1,23 @@
+services:
+  worker-ingest:
+    build: .
+    env_file: .env
+    environment:
+      WORKER_NAME: ingest-1
+      WORKER_KINDS: ingest_dfe
+    restart: unless-stopped
+
+  worker-pipeline:
+    build: .
+    env_file: .env
+    environment:
+      WORKER_NAME: pipeline-1
+      WORKER_KINDS: classify_chain,compute_taxes,project_cash
+    restart: unless-stopped
+
+  # Container da Calculadora RTC da Receita — imagem taggeada pela versão da regra.
+  # Só a rede interna alcança; o front nunca fala com ela.
+  rtc-calc:
+    image: fluxa/rtc-calc:2026.08.0
+    expose: ["8080"]
+    restart: unless-stopped
