@@ -9,7 +9,10 @@ export type Job = {
   attempts: number;
 };
 
-/** Reivindica um job da fila. O banco garante um job por tenant+kind (FOR UPDATE SKIP LOCKED). */
+/**
+ * Reivindica um job da fila. O banco garante um job por tenant+kind (FOR UPDATE SKIP LOCKED).
+ * claim_job devolve um CONJUNTO: vazio significa que não há trabalho.
+ */
 export async function claimJob(kinds: string[]): Promise<Job | null> {
   const { data, error } = await db.rpc("claim_job", {
     p_kinds: kinds,
@@ -17,7 +20,9 @@ export async function claimJob(kinds: string[]): Promise<Job | null> {
     p_lease_seconds: env.LEASE_SECONDS,
   });
   if (error) throw error;
-  return (data as Job) ?? null;
+  const rows = (data ?? []) as Job[];
+  const job = rows[0];
+  return job && job.id ? job : null;
 }
 
 export async function progress(jobId: string, pct: number, message?: string) {
