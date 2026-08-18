@@ -70,10 +70,12 @@ Três funções estão marcadas e lançam erro explícito em vez de devolver dad
   O **parser já é real** e funciona sobre qualquer XML que chegue.
 - `workers/classify-chain.ts → lookupRegime` — consulta de regime por CNPJ, com cache
   global de 30 dias (a mesma empresa aparece na cadeia de centenas de clientes).
-- `adapters/rtc-calc.ts` — hoje tem um modo degradado com alíquota fixa de 18% para
-  desenvolvimento. **Nunca subir isso em produção**: os valores são aproximados e não
-  têm base legal. Em produção, `RTC_CALC_URL` aponta para o container da Receita e a
-  imagem é taggeada com a versão da regra.
+- `adapters/rtc-calc.ts` — **implementado com o contrato real** do componente offline
+  (`POST /api/calculadora/regime-geral`, `validar-xml`, `dados-abertos/*`). Exige o container
+  no ar (`scripts/rtc-calc/README.md`); sem `RTC_CALC_URL` lança `EngineUnavailableError`.
+  O stub de 18% só liga com `RTC_CALC_ALLOW_STUB=1` fora de produção. Falta apenas
+  confirmar contra o Swagger da versão instalada os campos opcionais (`impostoSeletivo`,
+  `tributacaoRegular`, `gRed`) — o núcleo `gIBSCBS` está aderente à documentação.
 
 ## Segurança
 

@@ -1,6 +1,7 @@
 import { db } from "../lib/supabase.js";
 import { progress, type Job } from "../lib/jobs.js";
-import { calculate } from "../adapters/rtc-calc.js";
+import { calculateBatch, engineInfo } from "../adapters/rtc-calc.js";
+import { env } from "../lib/env.js";
 
 /**
  * svc-calc — aplica a Calculadora oficial e carimba a versão da regra.
@@ -31,6 +32,16 @@ export async function computeTaxes(job: Job) {
   const ruleVersion = rule?.calc_version;
   if (!ruleVersion) throw new Error("nenhuma rule_version marcada como is_current");
 
+  // Regra versionada: o motor no ar tem que ser o da rule_version corrente.
+  // engineInfo() falha alto se RTC_CALC_VERSION divergir do dados-abertos/versao.
+  if (env.RTC_CALC_URL) {
+    const eng = await engineInfo();
+    if (eng.versao !== ruleVersion) {
+      throw new Error(`rule_version corrente é ${ruleVersion}, mas o motor no ar é ${eng.versao}. ` +
+        `Publique uma rule_version para ${eng.versao} (painel da plataforma) antes de calcular.`);
+    }
+  }
+
   await progress(job.id, 5, "Levantando assinaturas fiscais distintas");
 
   let totalSignatures = 0;
@@ -46,23 +57,28 @@ export async function computeTaxes(job: Job) {
     await progress(job.id, Math.min(10 + round * 5, 60),
       `Consultando a calculadora para ${list.length} assinaturas`);
 
-    const rules: Array<Record<string, unknown>> = [];
-    for (const s of list) {
-      // base fictícia de R$ 100 só para extrair ALÍQUOTA e redução — a regra é
-      // proporcional, e a base real de cada item entra depois, no SQL.
-      const out = await calculate({
-        cst: s.cst, cclasstrib: s.cclasstrib,
-        ncm: s.classificacao || undefined,
-        baseCents: 10000,
-        ufOrigem: s.uf_origem || "GO", ufDestino: s.uf_destino || "GO",
-        municipioDestino: s.municipio || undefined,
-        issuedAt: `${s.ano}-06-15`,
-      });
+    // Uma chamada em lote por até 200 assinaturas (o endpoint aceita itens[]).
+    // Base fictícia de R$ 100 só para extrair ALÍQUOTA e redução — a regra é
+    // proporcional; a base real de cada item entra depois, no SQL (apply_calc_rules).
+    const outs = await calculateBatch(list.map((s) => ({
+      cst: s.cst, cclasstrib: s.cclasstrib,
+      ncm: s.classificacao || undefined,
+      baseCents: 10000,
+      ufDestino: s.uf_destino || env.RTC_DEFAULT_UF,
+      municipioDestino: s.municipio || undefined,
+      issuedAt: `${s.ano}-06-15`,
+    })));
 
-      rules.push({
+    const rules: Array<Record<string, unknown>> = list.map((s, k) => {
+      const out = outs[k];
+      if (!out) throw new Error(`Calculadora não devolveu a assinatura ${k + 1} do lote`);
+      return {
         rule_version: ruleVersion,
         cst: s.cst, cclasstrib: s.cclasstrib, classificacao: s.classificacao,
         uf_origem: s.uf_origem, uf_destino: s.uf_destino, municipio: s.municipio, ano: s.ano,
+        // apply_calc_rules multiplica base_cents pela alíquota em FRAÇÃO e aplica reducao_pct/100.
+        // Se o motor já devolveu alíquota efetiva (gRed.pAliqEfet), usamos a NOMINAL + reducao,
+        // que é o que a função do banco espera.
         aliq_ibs_uf: out.aliquotas.ibsUf ?? out.ibsUfCents / 10000,
         aliq_ibs_mun: out.aliquotas.ibsMun ?? out.ibsMunCents / 10000,
         aliq_cbs: out.aliquotas.cbs ?? out.cbsCents / 10000,
@@ -70,9 +86,9 @@ export async function computeTaxes(job: Job) {
         reducao_pct: out.reducaoPct ?? 0,
         permite_credito: out.creditEligible,
         memoria: out.memory,
-      });
-      totalSignatures++;
-    }
+      };
+    });
+    totalSignatures += list.length;
 
     const { error: eUp } = await db.rpc("calc_rule_cache_upsert", { p: rules });
     if (eUp) throw eUp;

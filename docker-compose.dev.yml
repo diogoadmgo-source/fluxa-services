@@ -1,0 +1,9 @@
+# Sobrescrita para desenvolvimento local: expõe a calculadora no host para o
+# Simulador/Validador do tech-iva (RTC_CALC_URL=http://localhost:8080) e o Swagger.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d rtc-calc
+services:
+  rtc-calc:
+    ports:
+      - "8080:8080"   # API Regime Geral + Swagger em http://localhost:8080/api
+      - "8081:8081"   # API Split Payment simplificado
+      - "80:80"       # site local da Calculadora (simulador web)

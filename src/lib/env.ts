@@ -5,6 +5,9 @@ const schema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
   RTC_CALC_URL: z.string().url().optional(),
   RTC_CALC_VERSION: z.string().default("dev"),
+  /** UF/município IBGE usados quando a assinatura fiscal não traz destino (art. 11 LC 214/25). */
+  RTC_DEFAULT_UF: z.string().length(2).default("GO"),
+  RTC_DEFAULT_MUNICIPIO: z.string().regex(/^\d{7}$/).default("5208707"),   // Goiânia
   CNPJ_API_URL: z.string().optional(),
   CNPJ_API_KEY: z.string().optional(),
 
