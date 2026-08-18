@@ -5,12 +5,14 @@ import { ingestDfe } from "./workers/ingest-dfe.js";
 import { classifyChain } from "./workers/classify-chain.js";
 import { computeTaxes } from "./workers/compute-taxes.js";
 import { projectCash } from "./workers/project-cash.js";
+import { fetchApuracao } from "./workers/fetch-apuracao.js";
 
 const handlers: Record<string, (job: Job) => Promise<Record<string, unknown>>> = {
   ingest_dfe: ingestDfe,
   classify_chain: classifyChain,
   compute_taxes: computeTaxes,
   project_cash: projectCash,
+  fetch_apuracao: fetchApuracao,
 };
 
 let running = true;
