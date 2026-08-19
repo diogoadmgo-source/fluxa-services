@@ -13,11 +13,16 @@ import { log } from "../lib/log.js";
  *    (Java 21). Ver scripts/rtc-calc/README.md para importar e subir.
  *  - Ele NÃO coleta dados nem tem telemetria: o dado fiscal do cliente fica aqui.
  *
- * CONTRATO REAL (documentação técnica do componente, endpoints locais):
- *   POST /api/calculadora/regime-geral        cálculo (JSON, formato NF-e/ROC)
- *   POST /api/calculadora/validar-xml?tipo=nfe&subtipo=grupo   validador (XML)
- *   POST /api/calculadora/gerar-xml           gerador de grupo XML a partir do cálculo
- *   GET  /api/calculadora/dados-abertos/versao
+ * CONTRATO REAL — conferido no CÓDIGO-FONTE oficial (codigo-fonte-backend.zip,
+ * br.gov.serpro.rtc.api.controller.*) e nos scripts-python-exemplo do pacote:
+ *   POST /api/calculadora/regime-geral              cálculo (OperacaoInput → ROC)
+ *        body: { id, versao, dhFatoGerador (dataHoraEmissao está @Deprecated),
+ *                municipio (IBGE, @NotNull), uf, itens:[{numero, ncm|nbs, cst(3), cClassTrib(6),
+ *                baseCalculo, quantidade, unidade, impostoSeletivo?, tributacaoRegular?}] }
+ *   POST /api/calculadora/xml/validate?tipo=nfe&subtipo=grupo   (XML → boolean)
+ *   POST /api/calculadora/xml/generate?tipo=nfe                 (ROC JSON → XML)
+ *   GET  /api/calculadora/dados-abertos/versao  → { versaoApp, versaoDb, descricaoVersaoDb, dataVersaoDb, ambiente }
+ *   GET  /api/calculadora/dados-abertos/versao/status           (comparativo local × remoto)
  *   GET  /api/calculadora/dados-abertos/classificacoes-tributarias/cbs-ibs
  *   GET  /api/calculadora/dados-abertos/situacoes-tributarias/cbs-ibs
  *   GET  /api/calculadora/dados-abertos/ncm | nbs | ufs | ufs/municipios | fundamentacoes-legais
@@ -81,7 +86,8 @@ export class EngineUnavailableError extends Error {
 }
 
 const CALC_PATH = "/api/calculadora/regime-geral";
-const VALIDATE_PATH = "/api/calculadora/validar-xml";
+const VALIDATE_PATH = "/api/calculadora/xml/validate";
+const GENERATE_PATH = "/api/calculadora/xml/generate";
 const VERSION_PATH = "/api/calculadora/dados-abertos/versao";
 const CLASSTRIB_PATH = "/api/calculadora/dados-abertos/classificacoes-tributarias/cbs-ibs";
 const TIMEOUT_MS = 30_000;
@@ -106,8 +112,13 @@ export async function engineInfo(): Promise<{ versao: string; url: string }> {
   } catch (e) {
     throw new EngineUnavailableError("unreachable", `Calculadora RTC inacessível em ${env.RTC_CALC_URL}: ${(e as Error).message}`);
   }
-  const versao = String(raw?.versao ?? raw?.version ?? raw ?? "").trim();
-  if (!versao) throw new EngineUnavailableError("error", "dados-abertos/versao sem campo de versão");
+  // VersaoOutput oficial: versaoApp (semver do motor) + versaoDb (base normativa embarcada).
+  // A identidade da regra é o PAR — a mesma app com outra base de dados calcula diferente.
+  const versaoApp = String(raw?.versaoApp ?? "").trim();
+  const versaoDb = String(raw?.versaoDb ?? "").trim();
+  const versao = versaoApp && versaoDb ? `${versaoApp}-db${versaoDb}` : String(raw?.versao ?? raw?.versaoApp ?? "").trim();
+  if (!versao) throw new EngineUnavailableError("error", `dados-abertos/versao sem versaoApp/versaoDb: ${JSON.stringify(raw).slice(0, 200)}`);
+  log.info({ versaoApp, versaoDb, dataVersaoDb: raw?.dataVersaoDb, ambiente: raw?.ambiente }, "Calculadora RTC no ar");
   if (env.RTC_CALC_VERSION && env.RTC_CALC_VERSION !== "dev" && env.RTC_CALC_VERSION !== versao) {
     throw new EngineUnavailableError("error",
       `Versão do motor (${versao}) difere de RTC_CALC_VERSION (${env.RTC_CALC_VERSION}). ` +
@@ -180,10 +191,11 @@ function buildBody(head: CalcInput, itens: Array<{ n: number; i: CalcInput }>) {
   const municipio = head.municipioDestino ?? env.RTC_DEFAULT_MUNICIPIO;
   return {
     id: cryptoId(),
-    versao: "0.0.1",
-    dataHoraEmissao: dt,
+    versao: "1.0.0",
+    dhFatoGerador: dt,
+    dataHoraEmissao: dt,          // campo legado (@Deprecated no OperacaoInput); builds antigas só leem este
     uf: head.ufDestino,
-    ...(municipio ? { municipio: Number(municipio) } : {}),
+    municipio: Number(municipio), // @NotNull no OperacaoInput — por isso existe RTC_DEFAULT_MUNICIPIO
     itens: itens.map(({ n, i }) => ({
       numero: n,
       ...(i.ncm ? { ncm: i.ncm } : {}),
@@ -236,8 +248,10 @@ function parseItem(obj: any, input: CalcInput): CalcOutput {
 }
 
 /**
- * ASSISTENTE VALIDADOR oficial. `tipo` = nfe|nfse|cte…, `subtipo` = grupo (só o
- * bloco IBSCBS) ou completo. Devolve `true` em sucesso; 422 traz `detail`.
+ * ASSISTENTE VALIDADOR oficial (XMLController.validate). `tipo` = TipoDocumento
+ * (nfe, nfce, cte, cte-simplificado, bpe, bpe-tm, nf3e…), `subtipo` = TipoXml
+ * (grupo = só o bloco IBSCBS/IS; completo = documento). Devolve boolean; erro de
+ * esquema vem como 4xx com `detail`.
  */
 export async function validateXml(xml: string, opts: { tipo?: string; subtipo?: string } = {}):
   Promise<{ valido: boolean; inconsistencias: unknown[] }> {
@@ -251,6 +265,18 @@ export async function validateXml(xml: string, opts: { tipo?: string; subtipo?: 
   let detail: unknown = text;
   try { detail = JSON.parse(text); } catch { /* texto puro */ }
   return { valido: false, inconsistencias: [detail] };
+}
+
+/** ASSISTENTE GERADOR: converte o ROC (saída do regime-geral) no grupo XML do documento. */
+export async function generateXml(roc: unknown, tipo = "nfe"): Promise<string> {
+  if (!env.RTC_CALC_URL) throw new EngineUnavailableError("not_configured", "generateXml exige RTC_CALC_URL");
+  const res = await request(`${env.RTC_CALC_URL}${GENERATE_PATH}?tipo=${encodeURIComponent(tipo)}`, {
+    method: "POST", headers: { "content-type": "application/json", accept: "application/xml" },
+    body: JSON.stringify(roc), headersTimeout: TIMEOUT_MS,
+  });
+  const text = await res.body.text();
+  if (res.statusCode >= 300) throw new Error(`xml/generate ${res.statusCode}: ${text.slice(0, 500)}`);
+  return text;
 }
 
 /** Dados abertos: classificações tributárias CBS/IBS (matriz CST × cClassTrib). */
