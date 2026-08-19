@@ -34,9 +34,37 @@ const INFO = (() => {
 })();
 
 type Envelope = {
-  v: number; alg: string; kdf: string;
+  v: number; alg: string; kdf: string; kid?: string;
   salt: string; wrap_iv: string; dek: string; iv: string; ct: string;
 };
+
+/**
+ * ANEL DE CHAVES — espelha o que o front passou a fazer.
+ *
+ * Envelope v2 carrega `kid` (identificador da chave usada). O v1 não tem, e por
+ * isso é tentado contra TODAS as chaves do anel.
+ *
+ * Por que isto existe: antes, trocar a chave mestra tornava ilegível todo
+ * envelope já criado — ou seja, um vazamento obrigaria TODOS os clientes a
+ * recadastrar certificado. Com o anel, a chave nova cifra o que é novo e a
+ * antiga continua abrindo o que já existe, sem incomodar ninguém.
+ */
+function anel(): Array<{ kid: string; chave: string }> {
+  const r: Array<{ kid: string; chave: string }> = [];
+  const ativa = process.env["DFE_SECRET_KEY"];
+  const anterior = process.env["DFE_SECRET_KEY_PREVIOUS"];
+  // O identificador é comparado em minúsculas dos dois lados. No primeiro teste
+  // real, o front gravou "K2" e o worker estava com "k2": a credencial existia,
+  // a chave era a certa, e mesmo assim não abria. Diferença de caixa em um
+  // rótulo não pode custar o acesso do cliente ao dado dele.
+  if (ativa) r.push({ kid: (process.env["DFE_SECRET_KEY_ID"] ?? "k1").toLowerCase(), chave: ativa });
+  if (anterior) r.push({ kid: (process.env["DFE_SECRET_KEY_PREVIOUS_ID"] ?? "k0").toLowerCase(), chave: anterior });
+  if (r.length === 0) {
+    throw new Error("DFE_SECRET_KEY não configurada: sem a chave mestra é impossível " +
+      "abrir as credenciais cifradas.");
+  }
+  return r;
+}
 
 /**
  * base64 -> bytes. O `slice()` importa: Buffer.from devolve uma view sobre um
@@ -48,18 +76,13 @@ const fromB64 = (s: string): ArrayBuffer => {
   return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
 };
 
-function chaveMestra(): ArrayBuffer {
-  const k = process.env["DFE_SECRET_KEY"];
-  if (!k) {
-    throw new Error("DFE_SECRET_KEY não configurada: sem a chave mestra é impossível " +
-      "abrir as credenciais cifradas. Ela deve ser a MESMA usada pelo front ao cifrar.");
-  }
+function paraBuffer(k: string): ArrayBuffer {
   const b = new TextEncoder().encode(k);
   return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
 }
 
-async function derivarKek(salt: ArrayBuffer): Promise<CryptoKey> {
-  const material = await crypto.subtle.importKey("raw", chaveMestra(), "HKDF", false, ["deriveKey"]);
+async function derivarKek(salt: ArrayBuffer, chave: string): Promise<CryptoKey> {
+  const material = await crypto.subtle.importKey("raw", paraBuffer(chave), "HKDF", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "HKDF", hash: "SHA-256", salt, info: INFO },
     material,
@@ -77,20 +100,35 @@ export async function abrirEnvelope(bytes: Uint8Array): Promise<string> {
   } catch {
     throw new Error("O objeto no cofre não está no formato de envelope esperado.");
   }
-  if (env_.v !== 1 || env_.alg !== "AES-256-GCM") {
+  if ((env_.v !== 1 && env_.v !== 2) || env_.alg !== "AES-256-GCM") {
     throw new Error(`Envelope em versão/algoritmo não suportado (v=${env_.v}, alg=${env_.alg}).`);
   }
 
-  const kek = await derivarKek(fromB64(env_.salt));
+  // v2 diz qual chave usar; v1 não sabe, então tentamos o anel inteiro.
+  const kidEnvelope = env_.kid?.toLowerCase();
+  const candidatas = kidEnvelope
+    ? anel().filter((k) => k.kid === kidEnvelope)
+    : anel();
 
-  let dekRaw: ArrayBuffer;
-  try {
-    dekRaw = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: fromB64(env_.wrap_iv) }, kek, fromB64(env_.dek));
-  } catch {
-    // Falha aqui quase sempre significa chave mestra diferente da usada ao cifrar.
-    throw new Error("Não foi possível abrir a credencial: a chave mestra do worker " +
-      "não corresponde à usada no momento do cadastro.");
+  if (candidatas.length === 0) {
+    throw new Error(`A credencial foi cifrada com a chave "${env_.kid}", que não está ` +
+      `configurada neste worker. Configure DFE_SECRET_KEY (ou a anterior) correspondente.`);
+  }
+
+  let dekRaw: ArrayBuffer | null = null;
+  for (const k of candidatas) {
+    try {
+      dekRaw = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: fromB64(env_.wrap_iv) },
+        await derivarKek(fromB64(env_.salt), k.chave),
+        fromB64(env_.dek));
+      break;
+    } catch { /* tenta a próxima do anel */ }
+  }
+
+  if (!dekRaw) {
+    throw new Error("Não foi possível abrir a credencial: nenhuma das chaves mestras " +
+      "configuradas corresponde à usada no momento do cadastro.");
   }
 
   const dek = await crypto.subtle.importKey("raw", dekRaw, { name: "AES-GCM" }, false, ["decrypt"]);
@@ -124,4 +162,64 @@ export async function abrirCertificado(secretRef: string):
     throw new Error("Envelope do certificado incompleto.");
   }
   return { pfx: new Uint8Array(fromB64(bundle.pfx)), password: bundle.password };
+}
+
+/**
+ * Converte o certificado A1 para PEM (chave privada + cadeia de certificados).
+ *
+ * POR QUE ISTO EXISTE — armadilha real, descoberta no primeiro handshake com a
+ * Receita: o Node recusou o arquivo com "Unsupported PKCS12 PFX data", embora o
+ * certificado esteja perfeitamente íntegro (o front leu titular, CNPJ e
+ * impressão digital sem dificuldade).
+ *
+ * A causa é o OpenSSL 3, embutido no Node: ele desabilitou por padrão os
+ * algoritmos antigos (RC2, 3DES) que os certificados A1 brasileiros usam para
+ * proteger o PKCS#12. Não é defeito do certificado nem do Node — é uma decisão
+ * de segurança do OpenSSL que colide com o formato que as ACs brasileiras
+ * continuam emitindo.
+ *
+ * A saída é ler o PKCS#12 com uma biblioteca em JavaScript puro (node-forge),
+ * que implementa os algoritmos antigos, e entregar ao TLS o material já em PEM.
+ * O TLS aceita PEM sem restrição.
+ *
+ * O material convertido existe apenas em memória, pelo tempo da chamada.
+ */
+export async function certificadoParaPem(secretRef: string):
+  Promise<{ key: string; cert: string }> {
+  const forge = (await import("node-forge")).default;
+  const { pfx, password } = await abrirCertificado(secretRef);
+
+  let p12;
+  try {
+    const asn1 = forge.asn1.fromDer(forge.util.createBuffer(Buffer.from(pfx).toString("binary")));
+    p12 = forge.pkcs12.pkcs12FromAsn1(asn1, false, password);
+  } catch (e) {
+    throw new Error("Não foi possível abrir o certificado digital. " +
+      "Verifique se o arquivo e a senha continuam válidos. " +
+      `(detalhe: ${e instanceof Error ? e.message : String(e)})`);
+  }
+
+  // Chave privada. Os A1 brasileiros usam pkcs8ShroudedKeyBag; alguns emissores
+  // usam keyBag simples, então tentamos os dois.
+  const oidShrouded = forge.pki.oids["pkcs8ShroudedKeyBag"] as string;
+  const oidKeyBag = forge.pki.oids["keyBag"] as string;
+  const oidCert = forge.pki.oids["certBag"] as string;
+
+  const bags: any = p12.getBags({ bagType: oidShrouded });
+  const bagsChave: any[] = (bags?.[oidShrouded] as any[])
+    ?? ((p12.getBags({ bagType: oidKeyBag }) as any)?.[oidKeyBag] as any[])
+    ?? [];
+  const chave = bagsChave[0]?.key;
+  if (!chave) throw new Error("O certificado não contém chave privada utilizável.");
+
+  // Certificado do titular + cadeia. A Receita pode exigir a cadeia completa,
+  // então enviamos todos os certificados presentes no arquivo.
+  const bagsCert: any[] = ((p12.getBags({ bagType: oidCert }) as any)?.[oidCert] as any[]) ?? [];
+  const certs = bagsCert.map((b: any) => b.cert).filter(Boolean);
+  if (certs.length === 0) throw new Error("O certificado não contém nenhum certificado X.509.");
+
+  return {
+    key: forge.pki.privateKeyToPem(chave),
+    cert: certs.map((c: any) => forge.pki.certificateToPem(c)).join("\n"),
+  };
 }

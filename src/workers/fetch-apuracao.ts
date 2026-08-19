@@ -49,15 +49,29 @@ async function solicitar(job: Job) {
   const p = pedido as any;
   if (!p?.ok) return { solicitado: false, motivo: p?.motivo, cota: p?.cota };
 
-  await progress(job.id, 35, "Autenticando na Receita");
-  const { clientId, clientSecret } = await credencialRtc(tenant);
-  const token = await obterToken(clientId, clientSecret);
-
-  await progress(job.id, 60, "Solicitando a apuração");
-  const urlRetorno = `${env.RTC_WEBHOOK_BASE}/functions/v1/rtc-webhook?ref=${p.webhook_ref}`;
+  // A cota já foi debitada acima. A partir daqui, QUALQUER falha precisa passar
+  // pelo tratamento — inclusive as que acontecem antes de sair da nossa máquina.
+  //
+  // Na primeira execução real este bloco não existia: a leitura da credencial
+  // falhou FORA do try, o job morreu, e a cota do dia ficou consumida por uma
+  // consulta que nunca chegou à Receita. O cliente perdia o direito do dia por
+  // um erro nosso.
+  //
+  // Distinção que importa: erro LOCAL devolve a cota (nada foi consumido lá
+  // fora); erro DA RECEITA não devolve (a chamada aconteceu de verdade).
+  let saiuDaNossaMaquina = false;
 
   try {
-    const r = await solicitarApuracao(token, p.cnpj8, urlRetorno);
+    await progress(job.id, 35, "Autenticando na Receita");
+    const { clientId, clientSecret, certRef } = await credencialRtc(tenant);
+
+    saiuDaNossaMaquina = true;   // a partir daqui há tráfego externo
+    const token = await obterToken(clientId, clientSecret, certRef);
+
+    await progress(job.id, 60, "Solicitando a apuração");
+    const urlRetorno = `${env.RTC_WEBHOOK_BASE}/functions/v1/rtc-webhook?ref=${p.webhook_ref}`;
+    const r = await solicitarApuracao(token, p.cnpj8, urlRetorno, certRef);
+
     await db.from("rtc_apuracao").update({ tiquete_solicitacao: r.tiquete ?? null })
       .eq("id", p.id);
     await marcarUso(tenant, "consulta_apuracao", true, job.id, "solicitação enviada");
@@ -65,10 +79,13 @@ async function solicitar(job: Job) {
       aviso: "A Receita responderá no nosso webhook. O download acontece em seguida, automaticamente." };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    await db.from("rtc_apuracao").update({ status: "erro", erro: msg, webhook_ref: null })
-      .eq("id", p.id);
+    await db.rpc("rtc_apuracao_falhar", {
+      p_id: p.id, p_erro: msg, p_devolver_cota: !saiuDaNossaMaquina,
+    });
     await marcarUso(tenant, "consulta_apuracao", false, job.id, msg);
-    throw e;
+    throw new Error(msg + (!saiuDaNossaMaquina
+      ? " (a consulta não chegou à Receita; a cota do dia foi devolvida)"
+      : ""));
   }
 }
 
@@ -94,9 +111,9 @@ async function baixarPendentes(job: Job) {
     }
 
     try {
-      const { clientId, clientSecret } = await credencialRtc(p.tenant_id);
-      const token = await obterToken(clientId, clientSecret);
-      const extrato = await baixarApuracao(token, p.tiquete);
+      const { clientId, clientSecret, certRef } = await credencialRtc(p.tenant_id);
+      const token = await obterToken(clientId, clientSecret, certRef);
+      const extrato = await baixarApuracao(token, p.tiquete, certRef);
 
       // A ingestão apaga o tíquete: uso único, nunca tentar de novo.
       const { data: ing, error: eIng } = await db.rpc("rtc_apuracao_ingest_json", {
@@ -119,7 +136,8 @@ async function baixarPendentes(job: Job) {
 }
 
 /** Lê a credencial cifrada do cliente. Nunca loga o conteúdo. */
-async function credencialRtc(tenant: string): Promise<{ clientId: string; clientSecret: string }> {
+async function credencialRtc(tenant: string):
+  Promise<{ clientId: string; clientSecret: string; certRef: string | null }> {
   const { data: cred } = await db.from("integration_credentials")
     .select("id, secret_ref, status, finalidades")
     .eq("tenant_id", tenant).eq("provider", "rtc_cbs").eq("status", "ativa")
@@ -134,9 +152,33 @@ async function credencialRtc(tenant: string): Promise<{ clientId: string; client
   }
 
   const bruto = await abrirSegredo(cred.secret_ref);
-  const { clientId, clientSecret } = JSON.parse(bruto);
+
+  // FORMATO (confirmado com quem cifra, não suposto): texto puro UTF-8
+  //   <CLIENT_ID>:<CLIENT_SECRET>
+  // Sem JSON, sem quebra de linha, já com trim aplicado dos dois lados.
+  //
+  // A divisão é no PRIMEIRO dois-pontos apenas. O ClientSecret do Portal RTC
+  // pode conter ':' — um split(":") ingênuo cortaria a credencial no meio, e o
+  // sintoma seria um 401 da Receita depois de já ter gasto uma das 2 consultas
+  // diárias. Erro caro e difícil de diagnosticar.
+  const corte = bruto.indexOf(":");
+  if (corte <= 0 || corte === bruto.length - 1) {
+    throw new Error("Credencial da Receita em formato inesperado. " +
+      "Recadastre o ClientId e o ClientSecret em Configurações > Integrações.");
+  }
+  const clientId = bruto.slice(0, corte);
+  const clientSecret = bruto.slice(corte + 1);
   if (!clientId || !clientSecret) throw new Error("Credencial da Receita incompleta.");
-  return { clientId, clientSecret };
+
+  // As APIs da Receita exigem autenticação mútua: o certificado A1 da empresa
+  // é apresentado no handshake TLS, junto do token. Reaproveitamos o mesmo
+  // certificado já cadastrado para a ingestão de DF-e — o cliente não precisa
+  // subir dois.
+  const { data: cert } = await db.from("integration_credentials")
+    .select("secret_ref").eq("tenant_id", tenant).eq("provider", "dfe")
+    .eq("kind", "certificado_a1").eq("status", "ativa").maybeSingle();
+
+  return { clientId, clientSecret, certRef: cert?.secret_ref ?? null };
 }
 
 async function marcarUso(tenant: string, finalidade: string, sucesso: boolean,
