@@ -78,6 +78,11 @@ export type CalcOutput = {
   calcVersion: string;
 };
 
+/** Recusa do motor para UMA assinatura (NCM inexistente na data, cClassTrib inválido, etc.). */
+export type CalcRejected = { rejected: true; status: number; title?: string; detail: string };
+export type CalcResult = CalcOutput | CalcRejected;
+export const isRejected = (r: CalcResult | undefined): r is CalcRejected => !!r && (r as CalcRejected).rejected === true;
+
 export class EngineUnavailableError extends Error {
   constructor(public reason: "not_configured" | "unreachable" | "error", message: string) {
     super(message);
@@ -131,6 +136,7 @@ export async function engineInfo(): Promise<{ versao: string; url: string }> {
 export async function calculate(input: CalcInput): Promise<CalcOutput> {
   const [out] = await calculateBatch([input]);
   if (!out) throw new Error("Calculadora não devolveu resultado");
+  if (isRejected(out)) throw new Error(`Calculadora RTC ${out.status}: ${out.detail}`);
   return out;
 }
 
@@ -138,20 +144,25 @@ export async function calculate(input: CalcInput): Promise<CalcOutput> {
  * Calcula vários itens numa só chamada (o endpoint aceita `itens[]`).
  * Todos os itens de um lote precisam compartilhar UF/município/data — o payload
  * é uma "nota" única. Aqui agrupamos por essa chave e disparamos um POST por grupo.
+ *
+ * O endpoint é TUDO-OU-NADA: um NCM inexistente na data derruba a operação inteira
+ * com 404/422 (RFC 7807: type/title/status/detail). Por isso, quando um lote é
+ * recusado com 4xx, refazemos item a item e devolvemos CalcRejected só para os
+ * culpados — os outros itens seguem calculados. 5xx/rede continuam lançando.
  */
-export async function calculateBatch(inputs: CalcInput[]): Promise<CalcOutput[]> {
-  const results = new Array<CalcOutput | undefined>(inputs.length);
+export async function calculateBatch(inputs: CalcInput[]): Promise<CalcResult[]> {
+  const results = new Array<CalcResult | undefined>(inputs.length);
   const pending: number[] = [];
   inputs.forEach((i, idx) => {
     const hit = cache.get(cacheKey(i));
     if (hit) results[idx] = hit; else pending.push(idx);
   });
-  if (pending.length === 0) return results as CalcOutput[];
+  if (pending.length === 0) return results as CalcResult[];
 
   if (!env.RTC_CALC_URL) {
     if (stubAllowed()) {
       for (const idx of pending) { const inp = inputs[idx]!; const o = stubCalculate(inp); cache.set(cacheKey(inp), o); results[idx] = o; }
-      return results as CalcOutput[];
+      return results as CalcResult[];
     }
     throw new EngineUnavailableError("not_configured",
       "RTC_CALC_URL não definida — suba o container da Calculadora (scripts/rtc-calc) ou, só em dev, RTC_CALC_ALLOW_STUB=1");
@@ -169,21 +180,41 @@ export async function calculateBatch(inputs: CalcInput[]): Promise<CalcOutput[]>
   for (const idxs of groups.values()) {
     for (let off = 0; off < idxs.length; off += MAX_ITEMS_PER_REQUEST) {
       const slice = idxs.slice(off, off + MAX_ITEMS_PER_REQUEST);
-      const first = inputs[slice[0]!]!;
-      const body = buildBody(first, slice.map((idx, n) => ({ n: n + 1, i: inputs[idx]! })));
-      const raw = await post(CALC_PATH, body);
-      const objetos: any[] = raw?.objetos ?? [];
-      slice.forEach((idx, n) => {
-        const obj = objetos.find((o) => Number(o?.nObj) === n + 1) ?? objetos[n];
-        if (!obj) throw new Error(`Calculadora não devolveu o item ${n + 1} do lote`);
-        const inp = inputs[idx]!;
-        const out = parseItem(obj, inp);
-        cache.set(cacheKey(inp), out);
-        results[idx] = out;
-      });
+      const ok = await tryBatch(inputs, slice, results);
+      if (ok) continue;
+      // lote recusado (4xx): item a item, para isolar os culpados
+      for (const idx of slice) {
+        await tryBatch(inputs, [idx], results, /*single*/ true);
+      }
     }
   }
-  return results as CalcOutput[];
+  return results as CalcResult[];
+}
+
+/** POST de um lote; em 4xx devolve false (chamador refaz item a item) ou, se single, grava CalcRejected. */
+async function tryBatch(inputs: CalcInput[], slice: number[], results: Array<CalcResult | undefined>, single = false): Promise<boolean> {
+  const first = inputs[slice[0]!]!;
+  const body = buildBody(first, slice.map((idx, n) => ({ n: n + 1, i: inputs[idx]! })));
+  const r = await post(CALC_PATH, body);
+  if (!r.ok) {
+    if (!single) return false;
+    const idx = slice[0]!;
+    const rej: CalcRejected = { rejected: true, status: r.status, title: r.problem?.title, detail: r.problem?.detail ?? r.text.slice(0, 300) };
+    log.warn({ status: r.status, detail: rej.detail, cst: first.cst, cclasstrib: first.cclasstrib, ncm: first.ncm, nbs: first.nbs, issuedAt: first.issuedAt },
+      "Calculadora RTC recusou a assinatura");
+    results[idx] = rej;          // não vai para o cache: pode ser corrigido na próxima rodada (outra data/NCM)
+    return true;
+  }
+  const objetos: any[] = r.json?.objetos ?? [];
+  slice.forEach((idx, n) => {
+    const obj = objetos.find((o) => Number(o?.nObj) === n + 1) ?? objetos[n];
+    if (!obj) throw new Error(`Calculadora não devolveu o item ${n + 1} do lote`);
+    const inp = inputs[idx]!;
+    const out = parseItem(obj, inp);
+    cache.set(cacheKey(inp), out);
+    results[idx] = out;
+  });
+  return true;
 }
 
 function buildBody(head: CalcInput, itens: Array<{ n: number; i: CalcInput }>) {
@@ -288,7 +319,10 @@ export async function fetchClassTribMatrix(): Promise<unknown[]> {
   return Array.isArray(raw) ? raw : (raw?.conteudo ?? raw?.content ?? []);
 }
 
-async function post(path: string, body: unknown): Promise<any> {
+type PostResult = { ok: true; status: number; json: any; text: string; problem?: undefined }
+               | { ok: false; status: number; json?: undefined; text: string; problem?: { type?: string; title?: string; detail?: string } };
+
+async function post(path: string, body: unknown): Promise<PostResult> {
   let res;
   try {
     res = await request(`${env.RTC_CALC_URL}${path}`, {
@@ -299,12 +333,15 @@ async function post(path: string, body: unknown): Promise<any> {
     throw new EngineUnavailableError("unreachable", `Calculadora RTC inacessível: ${(e as Error).message}`);
   }
   const text = await res.body.text();
-  if (res.statusCode >= 300) {
-    // 400 estrutura, 422 validação (CST/cClassTrib inválidos), 500 interno — o job falha alto
-    log.warn({ status: res.statusCode, body: text.slice(0, 500) }, "Calculadora RTC recusou o lote");
+  if (res.statusCode >= 500) {
+    // erro interno do motor: não é culpa do dado, o job deve falhar e tentar de novo
     throw new Error(`Calculadora RTC ${res.statusCode}: ${text.slice(0, 500)}`);
   }
-  return JSON.parse(text);
+  if (res.statusCode >= 400) {
+    let problem: any; try { problem = JSON.parse(text); } catch { /* texto puro */ }
+    return { ok: false, status: res.statusCode, text, problem };
+  }
+  return { ok: true, status: res.statusCode, json: JSON.parse(text), text };
 }
 
 const toCents = (v: unknown) => Math.round(Number(v ?? 0) * 100);

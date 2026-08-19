@@ -1,6 +1,6 @@
 import { db } from "../lib/supabase.js";
 import { progress, type Job } from "../lib/jobs.js";
-import { calculateBatch, engineInfo } from "../adapters/rtc-calc.js";
+import { calculateBatch, engineInfo, isRejected } from "../adapters/rtc-calc.js";
 import { env } from "../lib/env.js";
 
 /**
@@ -45,6 +45,9 @@ export async function computeTaxes(job: Job) {
   await progress(job.id, 5, "Levantando assinaturas fiscais distintas");
 
   let totalSignatures = 0;
+  // Assinaturas que o motor recusou (NCM inexistente na data, cClassTrib inválido…).
+  // Não derrubam o job: os outros itens são calculados e estas viram alerta.
+  const rejected: Array<Record<string, unknown>> = [];
   // Em lotes, porque um tenant novo pode ter muitas assinaturas na primeira carga.
   for (let round = 0; ; round++) {
     const { data: signatures, error } = await db.rpc("pending_calc_signatures", {
@@ -69,16 +72,20 @@ export async function computeTaxes(job: Job) {
       issuedAt: `${s.ano}-06-15`,
     })));
 
-    const rules: Array<Record<string, unknown>> = list.map((s, k) => {
+    const rules: Array<Record<string, unknown>> = [];
+    list.forEach((s, k) => {
       const out = outs[k];
       if (!out) throw new Error(`Calculadora não devolveu a assinatura ${k + 1} do lote`);
-      return {
+      if (isRejected(out)) {
+        rejected.push({ cst: s.cst, cclasstrib: s.cclasstrib, classificacao: s.classificacao, ano: s.ano,
+                        itens: s.itens, status: out.status, motivo: out.detail });
+        return;
+      }
+      rules.push({
         rule_version: ruleVersion,
         cst: s.cst, cclasstrib: s.cclasstrib, classificacao: s.classificacao,
         uf_origem: s.uf_origem, uf_destino: s.uf_destino, municipio: s.municipio, ano: s.ano,
         // apply_calc_rules multiplica base_cents pela alíquota em FRAÇÃO e aplica reducao_pct/100.
-        // Se o motor já devolveu alíquota efetiva (gRed.pAliqEfet), usamos a NOMINAL + reducao,
-        // que é o que a função do banco espera.
         aliq_ibs_uf: out.aliquotas.ibsUf ?? out.ibsUfCents / 10000,
         aliq_ibs_mun: out.aliquotas.ibsMun ?? out.ibsMunCents / 10000,
         aliq_cbs: out.aliquotas.cbs ?? out.cbsCents / 10000,
@@ -86,14 +93,18 @@ export async function computeTaxes(job: Job) {
         reducao_pct: out.reducaoPct ?? 0,
         permite_credito: out.creditEligible,
         memoria: out.memory,
-      };
+      });
     });
     totalSignatures += list.length;
 
-    const { error: eUp } = await db.rpc("calc_rule_cache_upsert", { p: rules });
-    if (eUp) throw eUp;
+    if (rules.length > 0) {
+      const { error: eUp } = await db.rpc("calc_rule_cache_upsert", { p: rules });
+      if (eUp) throw eUp;
+    }
 
-    if (list.length < 500) break;   // acabaram as assinaturas pendentes
+    // pending_calc_signatures devolve as mesmas assinaturas rejeitadas na próxima
+    // volta (não entraram no cache) — por isso paramos quando só sobraram rejeitadas.
+    if (list.length < 500 || rules.length === 0) break;
   }
 
   await progress(job.id, 70, "Aplicando as regras a todos os itens");
@@ -106,13 +117,24 @@ export async function computeTaxes(job: Job) {
 
   const result = applied as { itens_atualizados: number; itens_sem_regra: number };
 
-  // Se sobrou item sem regra, é sinal de assinatura que a calculadora recusou.
-  // Falha alto: melhor o job falhar do que a tela mostrar número incompleto.
-  if (result.itens_sem_regra > 0) {
+  // Itens sem regra = assinaturas recusadas pelo motor. Não derruba o job: cria
+  // alerta para o usuário corrigir (NCM/cClassTrib) e o próximo compute_taxes pega.
+  // Só falha alto se NADA pôde ser calculado.
+  if (rejected.length > 0) {
+    const itensRejeitados = rejected.reduce((a, r) => a + Number(r.itens ?? 0), 0);
+    await db.from("alerts").insert({
+      tenant_id: tenant, kind: "inconsistent_item", severity: "warning",
+      title: `${itensRejeitados} itens não calculados: ${rejected.length} combinações CST/cClassTrib/NCM recusadas pela Calculadora`,
+      payload: { rule_version: ruleVersion, assinaturas: rejected.slice(0, 50), total_assinaturas: rejected.length },
+    });
+  }
+  if (result.itens_atualizados === 0 && result.itens_sem_regra > 0) {
     throw new Error(
-      `${result.itens_sem_regra} itens ficaram sem regra fiscal — provável CST/cClassTrib inválido. ` +
-      `Verifique as inconsistências antes de confiar nos totais.`);
+      `Nenhum item calculado: todas as ${rejected.length} assinaturas foram recusadas pela Calculadora ` +
+      `(ex.: ${rejected[0]?.motivo ?? "motivo não informado"}).`);
   }
 
-  return { ...result, assinaturas_calculadas: totalSignatures, rule_version: ruleVersion };
+  return { ...result, assinaturas_calculadas: totalSignatures - rejected.length,
+           assinaturas_rejeitadas: rejected.length, rule_version: ruleVersion,
+           rejeitadas_amostra: rejected.slice(0, 5) };
 }
