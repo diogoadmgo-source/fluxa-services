@@ -1,6 +1,9 @@
 import { db } from "../lib/supabase.js";
 import { progress, enqueue, type Job } from "../lib/jobs.js";
 import { parseNFe, type ParsedInvoice } from "../adapters/dfe.js";
+import { distDFe, manifestarCiencia, chaveDoResumo, ConsumoIndevidoError } from "../adapters/dfe-distribuicao.js";
+import { certificadoParaPem } from "../lib/secrets.js";
+import { log } from "../lib/log.js";
 
 /**
  * svc-ingest — baixa DF-e, guarda o XML bruto e materializa notas, itens e parcelas.
@@ -98,19 +101,107 @@ export async function ingestDfe(job: Job) {
 }
 
 /**
- * Fonte dos XMLs. Deve ser um STREAM, não um array: um cliente com 100 mil notas
- * não cabe na memória do worker de uma vez.
+ * Fonte dos XMLs: NFeDistribuicaoDFe do Ambiente Nacional, autenticado com o
+ * certificado A1 do PRÓPRIO TENANT (integration_credentials, provider='dfe',
+ * finalidade 'ingest_dfe'). Paginação por NSU com estado em dfe_sync_state.
  *
- * TODO(produção): distribuição DF-e paginada por NSU, autenticada com o
- * certificado A1 do tenant (guardado cifrado, referenciado por
- * integration_credentials.secret_ref) ou pela procuração eletrônica. Guardar o
- * XML bruto no Storage em dfe/{tenant}/{aaaa-mm}/{chave}.xml antes de parsear —
- * o XML é a prova documental e precisa sobreviver a qualquer mudança nossa.
+ * O que cada schema vira:
+ *  - procNFe*   → XML completo: guarda o bruto no Storage (dfe-raw) e ENTREGA ao parse;
+ *  - resNFe*    → resumo de compra ainda não manifestada: registra em dfe_pending_manifest
+ *                 e dispara Ciência da Operação (210210). O XML completo chega nos
+ *                 próximos lotes da distribuição — a rodada seguinte o ingere.
+ *  - resEvento* e procEventoNFe* → eventos (cancelamento, ciência confirmada…): apenas
+ *                 registrados por enquanto.
+ *
+ * Regras do AN respeitadas: para quando cStat=137 (fim da fila) e NUNCA repete a
+ * chamada com ultNSU==maxNSU (o AN pune com 656 por 1h — ConsumoIndevidoError
+ * encerra a rodada com aviso, sem falhar o job).
  */
 async function* fetchXmlStream(
-  _job: Job, _desde: number
+  job: Job, _desde: number
 ): AsyncGenerator<{ xml: string; path: string; total: number }> {
-  throw new Error(
-    "fetchXmlStream não implementado: conectar à distribuição DF-e com o certificado " +
-    "do tenant (integration_credentials, provider='dfe') e paginar por NSU");
+  const tenant = job.tenant_id;
+
+  const { data: t } = await db.from("tenants").select("cnpj, settings").eq("id", tenant).single();
+  const cnpj = String(t?.cnpj ?? "").replace(/\D/g, "");
+  if (!cnpj) throw new Error("Tenant sem CNPJ — impossível consultar a distribuição DF-e.");
+  const ufAutor = Number(((t?.settings as any)?.uf_ibge) ?? 52);   // GO por padrão
+
+  const { data: cred, error: eCred } = await db.from("integration_credentials")
+    .select("id, secret_ref").eq("tenant_id", tenant).eq("provider", "dfe")
+    .eq("kind", "certificado_a1").eq("status", "ativa")
+    .contains("finalidades", ["ingest_dfe"])
+    .order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (eCred) throw eCred;
+  if (!cred) throw new Error("Nenhum certificado A1 ativo com finalidade ingest_dfe para esta empresa. " +
+    "Cadastre em Integrações → Credenciais.");
+
+  const pem = await certificadoParaPem(cred.secret_ref);
+
+  const { data: st } = await db.from("dfe_sync_state").select("ult_nsu").eq("tenant_id", tenant).maybeSingle();
+  let ultNSU = String(st?.ult_nsu ?? "0");
+
+  let paginas = 0;
+  const pendentesCiencia: string[] = [];
+
+  try {
+    for (;;) {
+      const page = await distDFe(pem, cnpj, ufAutor, ultNSU);
+      paginas++;
+
+      const totalEstimado = Math.max(Number(page.maxNSU) - Number(ultNSU), page.docs.length);
+
+      for (const d of page.docs) {
+        if (/^procNFe/i.test(d.schema)) {
+          const chave = (d.xml.match(/Id="NFe(\d{44})"/)?.[1]) ?? d.nsu;
+          const path = `dfe/${tenant}/${chave.slice(2, 6)}/${chave}.xml`;
+          const { error: eUp } = await db.storage.from("dfe-raw")
+            .upload(path, new Blob([d.xml], { type: "application/xml" }), { upsert: true });
+          if (eUp) log.warn({ err: eUp.message, chave }, "não guardou o XML bruto (segue o parse)");
+          yield { xml: d.xml, path, total: totalEstimado };
+        } else if (/^resNFe/i.test(d.schema)) {
+          const r = chaveDoResumo(d.xml);
+          if (r?.chave) {
+            pendentesCiencia.push(r.chave);
+            await db.from("dfe_pending_manifest").upsert(
+              { tenant_id: tenant, chave: r.chave, emitente: r.emitente, valor_cents: Math.round(r.valor * 100) },
+              { onConflict: "tenant_id,chave", ignoreDuplicates: true });
+          }
+        } else {
+          await db.from("dfe_events").insert({ tenant_id: tenant, nsu: d.nsu, schema: d.schema, xml: d.xml })
+            .then(({ error }) => { if (error && !/duplicate/i.test(error.message)) log.warn({ err: error.message }, "evento não registrado"); });
+        }
+      }
+
+      ultNSU = page.ultNSU;
+      await db.from("dfe_sync_state").upsert(
+        { tenant_id: tenant, ult_nsu: ultNSU, max_nsu: page.maxNSU, last_stat: page.cStat, synced_at: new Date().toISOString() },
+        { onConflict: "tenant_id" });
+
+      // fim da fila: 137 sem documentos, ou alcançamos o maxNSU
+      if (page.cStat === 137 || page.docs.length === 0 || ultNSU >= page.maxNSU) break;
+    }
+  } catch (err) {
+    if (err instanceof ConsumoIndevidoError) {
+      log.warn({ motivo: err.xMotivo }, "AN pediu pausa (656) — rodada encerrada; a próxima retoma do NSU salvo");
+    } else {
+      throw err;
+    }
+  }
+
+  // Ciência da Operação para liberar o XML completo das compras resumidas.
+  if (pendentesCiencia.length > 0) {
+    const res = await manifestarCiencia(pem, cnpj, pendentesCiencia);
+    const ok = res.filter((r) => [135, 136, 573].includes(r.cStat));
+    for (const r of ok) {
+      await db.from("dfe_pending_manifest").update({ manifestado_em: new Date().toISOString(), cstat: r.cStat })
+        .eq("tenant_id", tenant).eq("chave", r.chave);
+    }
+    const falhas = res.filter((r) => ![135, 136, 573].includes(r.cStat));
+    if (falhas.length > 0) log.warn({ exemplos: falhas.slice(0, 3) }, `${falhas.length} manifestações recusadas`);
+    log.info({ manifestadas: ok.length, paginas }, "ciência da operação enviada — XMLs completos virão na próxima rodada");
+  }
+
+  await db.from("integration_credentials").update({ last_used_at: new Date().toISOString(), falhas_consecutivas: 0 })
+    .eq("id", cred.id);
 }
