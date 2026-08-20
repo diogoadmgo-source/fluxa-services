@@ -1,0 +1,19 @@
+# Proxy HTTPS da Calculadora para o app (Simulador/Validador do TechIVA).
+# Domínio: <IP com hífens>.sslip.io resolve para o próprio IP — HTTPS válido sem comprar domínio.
+# Autenticação: cabeçalho X-Api-Key deve bater com CALC_PROXY_KEY (.env). Sem chave → 401.
+# O motor rtc-calc continua sem porta pública; só o Caddy escuta em 80/443.
+{
+	email {$CALC_PROXY_EMAIL:admin@example.com}
+}
+
+{$CALC_PROXY_DOMAIN} {
+	@authorized header X-Api-Key {$CALC_PROXY_KEY}
+
+	handle @authorized {
+		reverse_proxy rtc-calc:8080
+	}
+
+	handle {
+		respond "unauthorized" 401
+	}
+}

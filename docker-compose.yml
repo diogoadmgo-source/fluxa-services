@@ -19,6 +19,25 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Proxy HTTPS com chave para o app (Lovable) alcançar a Calculadora.
+  # Requer no .env: CALC_PROXY_DOMAIN (ex.: 18-230-33-238.sslip.io) e CALC_PROXY_KEY.
+  # Porta 443/80 abertas no grupo de segurança da VM.
+  caddy:
+    image: caddy:2-alpine
+    ports: ["80:80", "443:443"]
+    environment:
+      CALC_PROXY_DOMAIN: ${CALC_PROXY_DOMAIN:-:80}
+      CALC_PROXY_KEY: ${CALC_PROXY_KEY:-troque-me}
+      CALC_PROXY_EMAIL: ${CALC_PROXY_EMAIL:-admin@example.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      rtc-calc:
+        condition: service_healthy
+    restart: unless-stopped
+
   # Calculadora de Tributos da Receita — componente OFICIAL, offline.
   # A imagem NÃO é construída aqui: é o rootfs distribuído pela RFB
   # (calculadora.tar.gz), importado uma vez com scripts/rtc-calc/import.{sh,ps1}
@@ -36,3 +55,7 @@ services:
       retries: 20
       start_period: 90s
     restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
