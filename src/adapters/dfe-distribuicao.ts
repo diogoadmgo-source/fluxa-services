@@ -26,7 +26,10 @@ const AN_DIST = "https://www1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribui
 const AN_EVENTO = "https://www1.nfe.fazenda.gov.br/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx";
 const TIMEOUT_MS = 60_000;
 
-const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", removeNSPrefix: true });
+// parseTagValue:false é OBRIGATÓRIO: a chave de acesso tem 44 dígitos e, convertida
+// a número JS, perde precisão e vira notação científica — foi assim que a primeira
+// rodada real corrompeu todas as chaves dos resumos em silêncio.
+const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", removeNSPrefix: true, parseTagValue: false });
 
 export type DistDoc = {
   nsu: string;
