@@ -142,7 +142,14 @@ async function* fetchXmlStream(
   let ultNSU = String(st?.ult_nsu ?? "0");
 
   let paginas = 0;
+  let vistos = { procNFe: 0, resNFe: 0, eventos: 0 };
   const pendentesCiencia: string[] = [];
+
+  // Resumos de rodadas anteriores que ainda não foram manifestados entram de novo:
+  // manifestação recusada ontem não pode significar compra perdida para sempre.
+  const { data: antigos } = await db.from("dfe_pending_manifest")
+    .select("chave").eq("tenant_id", tenant).is("manifestado_em", null).limit(500);
+  for (const a of antigos ?? []) pendentesCiencia.push(String(a.chave));
 
   try {
     for (;;) {
@@ -153,6 +160,7 @@ async function* fetchXmlStream(
 
       for (const d of page.docs) {
         if (/^procNFe/i.test(d.schema)) {
+          vistos.procNFe++;
           const chave = (d.xml.match(/Id="NFe(\d{44})"/)?.[1]) ?? d.nsu;
           const path = `dfe/${tenant}/${chave.slice(2, 6)}/${chave}.xml`;
           const { error: eUp } = await db.storage.from("dfe-raw")
@@ -160,14 +168,21 @@ async function* fetchXmlStream(
           if (eUp) log.warn({ err: eUp.message, chave }, "não guardou o XML bruto (segue o parse)");
           yield { xml: d.xml, path, total: totalEstimado };
         } else if (/^resNFe/i.test(d.schema)) {
+          vistos.resNFe++;
           const r = chaveDoResumo(d.xml);
           if (r?.chave) {
             pendentesCiencia.push(r.chave);
-            await db.from("dfe_pending_manifest").upsert(
+            const { error: ePend } = await db.from("dfe_pending_manifest").upsert(
               { tenant_id: tenant, chave: r.chave, emitente: r.emitente, valor_cents: Math.round(r.valor * 100) },
               { onConflict: "tenant_id,chave", ignoreDuplicates: true });
+            if (ePend) log.warn({ err: ePend.message, chave: r.chave }, "resumo não registrado em dfe_pending_manifest");
+          } else {
+            log.warn({ nsu: d.nsu }, "resNFe sem chave extraível — guardando em dfe_events");
+            await db.from("dfe_events").insert({ tenant_id: tenant, nsu: d.nsu, schema: d.schema, xml: d.xml })
+              .then(({ error }) => { if (error && !/duplicate/i.test(error.message)) log.warn({ err: error.message }, "evento não registrado"); });
           }
         } else {
+          vistos.eventos++;
           await db.from("dfe_events").insert({ tenant_id: tenant, nsu: d.nsu, schema: d.schema, xml: d.xml })
             .then(({ error }) => { if (error && !/duplicate/i.test(error.message)) log.warn({ err: error.message }, "evento não registrado"); });
         }
@@ -189,17 +204,27 @@ async function* fetchXmlStream(
     }
   }
 
+  log.info({ paginas, ...vistos, pendentes_ciencia: pendentesCiencia.length }, "distribuição consumida");
+
   // Ciência da Operação para liberar o XML completo das compras resumidas.
+  // FALHA AQUI NÃO DERRUBA O JOB: o download já aconteceu e o estado está salvo;
+  // as chaves ficam em dfe_pending_manifest e a próxima rodada tenta de novo.
   if (pendentesCiencia.length > 0) {
-    const res = await manifestarCiencia(pem, cnpj, pendentesCiencia);
-    const ok = res.filter((r) => [135, 136, 573].includes(r.cStat));
-    for (const r of ok) {
-      await db.from("dfe_pending_manifest").update({ manifestado_em: new Date().toISOString(), cstat: r.cStat })
-        .eq("tenant_id", tenant).eq("chave", r.chave);
+    try {
+      const unicas = [...new Set(pendentesCiencia)];
+      const res = await manifestarCiencia(pem, cnpj, unicas);
+      const ok = res.filter((r) => [135, 136, 573].includes(r.cStat));
+      for (const r of ok) {
+        await db.from("dfe_pending_manifest").update({ manifestado_em: new Date().toISOString(), cstat: r.cStat })
+          .eq("tenant_id", tenant).eq("chave", r.chave);
+      }
+      const falhas = res.filter((r) => ![135, 136, 573].includes(r.cStat));
+      if (falhas.length > 0) log.warn({ exemplos: falhas.slice(0, 3) }, `${falhas.length} manifestações recusadas`);
+      log.info({ manifestadas: ok.length }, "ciência da operação enviada — XMLs completos virão na próxima rodada");
+    } catch (err) {
+      log.warn({ err: err instanceof Error ? err.message : String(err), chaves: pendentesCiencia.length },
+        "manifestação falhou — chaves preservadas em dfe_pending_manifest para a próxima rodada");
     }
-    const falhas = res.filter((r) => ![135, 136, 573].includes(r.cStat));
-    if (falhas.length > 0) log.warn({ exemplos: falhas.slice(0, 3) }, `${falhas.length} manifestações recusadas`);
-    log.info({ manifestadas: ok.length, paginas }, "ciência da operação enviada — XMLs completos virão na próxima rodada");
   }
 
   await db.from("integration_credentials").update({ last_used_at: new Date().toISOString(), falhas_consecutivas: 0 })

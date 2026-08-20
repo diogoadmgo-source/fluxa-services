@@ -65,7 +65,11 @@ async function soap(url: string, action: string, inner: string, pem: { key: stri
   });
   const text = await res.body.text();
   if (res.statusCode >= 300) {
-    throw new Error(`Ambiente Nacional respondeu HTTP ${res.statusCode}: ${text.slice(0, 300)}`);
+    // SOAP Fault vem com o motivo no corpo — precisamos dele INTEIRO para diagnosticar
+    const reason = text.match(/<soap:Text[^>]*>([\s\S]*?)<\/soap:Text>/)?.[1]
+                ?? text.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/)?.[1]
+                ?? text.slice(0, 1200);
+    throw new Error(`Ambiente Nacional respondeu HTTP ${res.statusCode}: ${reason.trim().slice(0, 1200)}`);
   }
   return text;
 }
@@ -173,7 +177,9 @@ export async function manifestarCiencia(
 ): Promise<ManifestResult[]> {
   if (chaves.length === 0) return [];
   const out: ManifestResult[] = [];
-  const dh = new Date().toISOString().replace(/\.\d{3}Z$/, "-00:00");
+  // dhEvento em horário de Brasília com offset explícito (o AN valida o formato)
+  const agora = new Date(Date.now() - 3 * 3600_000);
+  const dh = agora.toISOString().replace(/\.\d{3}Z$/, "-03:00");
 
   for (let off = 0; off < chaves.length; off += 20) {
     const lote = chaves.slice(off, off + 20);
