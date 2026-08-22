@@ -14,3 +14,4 @@ docker compose build --no-cache worker-ingest worker-pipeline
 docker compose up -d --force-recreate worker-ingest worker-pipeline
 docker image prune -f >/dev/null 2>&1 || true
 echo "$(date -Is) deploy concluído"
+// deploy check 1787362176
