@@ -95,6 +95,9 @@ const VALIDATE_PATH = "/api/calculadora/xml/validate";
 const GENERATE_PATH = "/api/calculadora/xml/generate";
 const VERSION_PATH = "/api/calculadora/dados-abertos/versao";
 const CLASSTRIB_PATH = "/api/calculadora/dados-abertos/classificacoes-tributarias/cbs-ibs";
+const NCM_APLICAVEL_PATH = "/api/calculadora/dados-abertos/classificacoes-tributarias/ncm-aplicavel";
+const NBS_APLICAVEL_PATH = "/api/calculadora/dados-abertos/classificacoes-tributarias/nbs-aplicavel";
+const VALIDADE_DFE_PATH = "/api/calculadora/dados-abertos/classificacoes-tributarias/cbs-ibs";
 const TIMEOUT_MS = 30_000;
 const MAX_ITEMS_PER_REQUEST = 200;
 
@@ -321,6 +324,100 @@ export async function fetchClassTribMatrix(): Promise<unknown[]> {
 
 type PostResult = { ok: true; status: number; json: any; text: string; problem?: undefined }
                | { ok: false; status: number; json?: undefined; text: string; problem?: { type?: string; title?: string; detail?: string } };
+
+/* ------------------------------------------------- AUDITORIA DE MÉRITO -------
+ * O motor não devolve "qual cClassTrib eu deveria ter usado", mas responde se um
+ * cClassTrib é APLICÁVEL a um NCM/NBS numa data. Com isso e a matriz de reduções
+ * dos dados abertos, a auditoria: (a) reprova a classificação usada quando o
+ * motor diz que ela não vale para aquele NCM; (b) varre os candidatos aplicáveis
+ * e acha o que tem redução maior — o benefício que a empresa deixou na mesa.
+ * ---------------------------------------------------------------------------*/
+
+export type ClassTribInfo = {
+  cclasstrib: string;
+  cst?: string;
+  descricao?: string;
+  tipoAliquota?: string;
+  possuiReducao?: boolean;
+  pctReducaoCbs?: number;
+  pctReducaoIbsUf?: number;
+  pctReducaoIbsMun?: number;
+  creditoAdquirenteCbs?: boolean;
+  creditoAdquirenteIbs?: boolean;
+  tiposDfe?: unknown;
+  bruto: unknown;
+};
+
+/** GET /classificacoes-tributarias/cbs-ibs → matriz completa (usada uma vez por rule_version). */
+export async function classTribMatriz(): Promise<ClassTribInfo[]> {
+  const raw = (await getJson(CLASSTRIB_PATH)) as any;
+  const arr: any[] = Array.isArray(raw) ? raw : (raw?.conteudo ?? raw?.content ?? []);
+  return arr.map((c) => ({
+    cclasstrib: String(c.codigo ?? c.cClassTrib ?? ""),
+    cst: c.codigoSituacaoTributaria ?? c.cst ?? undefined,
+    descricao: c.descricao ?? undefined,
+    tipoAliquota: c.tipoAliquota ?? undefined,
+    possuiReducao: c.possuiPercentualReducao ?? undefined,
+    pctReducaoCbs: num(c.percentualReducaoCbs),
+    pctReducaoIbsUf: num(c.percentualReducaoIbsUf),
+    pctReducaoIbsMun: num(c.percentualReducaoIbsMun),
+    creditoAdquirenteCbs: c.indicaApropriacaoCreditoAdquirenteCbs ?? undefined,
+    creditoAdquirenteIbs: c.indicaApropriacaoCreditoAdquirenteIbs ?? undefined,
+    tiposDfe: c.tiposDfeClassificacao ?? undefined,
+    bruto: c,
+  })).filter((c) => c.cclasstrib);
+}
+
+/** GET /classificacoes-tributarias/cbs-ibs/{cst} → cClassTrib válidos para um CST (achado A2). */
+export async function classTribPorCst(cst: string): Promise<string[]> {
+  const raw = (await getJson(`${CLASSTRIB_PATH}/${encodeURIComponent(cst)}`)) as any;
+  const arr: any[] = Array.isArray(raw) ? raw : (raw?.conteudo ?? []);
+  return arr.map((c) => String(c.codigo ?? c.cClassTrib ?? "")).filter(Boolean);
+}
+
+/**
+ * O cClassTrib é aplicável a este NCM/NBS nesta data? (achados A3 e A5)
+ * O motor responde 200 {valido:true} ou erro de negócio (NCM não vinculada) —
+ * ambos são resposta legítima; só rede/5xx sobe como falha.
+ */
+export async function classificacaoAplicavel(
+  cclasstrib: string, tipo: "ncm" | "nbs", codigo: string, data: string,
+): Promise<{ valido: boolean; motivo?: string }> {
+  if (!env.RTC_CALC_URL) throw new EngineUnavailableError("not_configured", "classificacaoAplicavel exige RTC_CALC_URL");
+  const path = tipo === "ncm" ? NCM_APLICAVEL_PATH : NBS_APLICAVEL_PATH;
+  const q = new URLSearchParams({ cClassTrib: cclasstrib, [tipo]: codigo, dataOcorrenciaFatoGerador: data.slice(0, 10) });
+  const res = await request(`${env.RTC_CALC_URL}${path}?${q}`, { headersTimeout: TIMEOUT_MS });
+  const text = await res.body.text();
+  if (res.statusCode >= 500) throw new Error(`ncm/nbs-aplicavel ${res.statusCode}: ${text.slice(0, 300)}`);
+  if (res.statusCode >= 400) {
+    let motivo = text.slice(0, 300);
+    try { const p = JSON.parse(text); motivo = String(p.detail ?? p.title ?? motivo); } catch { /* texto */ }
+    return { valido: false, motivo };
+  }
+  try {
+    const j = JSON.parse(text);
+    return { valido: j?.valido === true, motivo: j?.valido === true ? undefined : "motor respondeu valido=false" };
+  } catch { return { valido: text.trim() === "true" }; }
+}
+
+/** GET /classificacoes-tributarias/cbs-ibs/{siglaDfe}/{cClassTrib} → validade por modelo de DF-e. */
+export async function classTribValidoParaDfe(siglaDfe: string, cclasstrib: string): Promise<boolean | null> {
+  try {
+    const raw = await getJson(`${VALIDADE_DFE_PATH}/${encodeURIComponent(siglaDfe)}/${encodeURIComponent(cclasstrib)}`);
+    const v = (raw as any)?.valido ?? (raw as any)?.valida;
+    return typeof v === "boolean" ? v : null;
+  } catch { return null; }
+}
+
+async function getJson(path: string): Promise<unknown> {
+  if (!env.RTC_CALC_URL) throw new EngineUnavailableError("not_configured", `${path} exige RTC_CALC_URL`);
+  const res = await request(`${env.RTC_CALC_URL}${path}`, { headersTimeout: TIMEOUT_MS });
+  const text = await res.body.text();
+  if (res.statusCode >= 300) throw new Error(`${path} ${res.statusCode}: ${text.slice(0, 300)}`);
+  return JSON.parse(text);
+}
+
+const num = (v: unknown) => (v == null || v === "" ? undefined : Number(v));
 
 async function post(path: string, body: unknown): Promise<PostResult> {
   let res;

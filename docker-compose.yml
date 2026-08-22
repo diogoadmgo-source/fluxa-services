@@ -12,7 +12,7 @@ services:
     env_file: .env
     environment:
       WORKER_NAME: pipeline-1
-      WORKER_KINDS: classify_chain,compute_taxes,project_cash,fetch_apuracao
+      WORKER_KINDS: classify_chain,compute_taxes,project_cash,fetch_apuracao,audit_merit
       RTC_CALC_URL: http://rtc-calc:8080
     depends_on:
       rtc-calc:
