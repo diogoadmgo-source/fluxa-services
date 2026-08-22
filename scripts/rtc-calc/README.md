@@ -5,6 +5,10 @@ A Receita não hospeda API de cálculo. O motor oficial é o **componente offlin
 Tributos sobre Consumo → Calculadora offline (login gov.br). Este diretório só o **importa**
 e **tagueia**; não construímos nada nosso por cima.
 
+## Auto-deploy
+Após o primeiro deploy manual, rode uma vez `bash scripts/vm/install-autodeploy.sh` na VM:
+um timer systemd passa a puxar o `main` a cada 5 minutos e reconstruir quando houver mudança.
+
 ## Uma vez por versão do motor
 1. Baixe o pacote Docker (zip ~260 MB) e extraia; o que interessa é `calculadora.tar.gz`.
 2. `./scripts/rtc-calc/import.sh /caminho/calculadora.tar.gz` (Linux/Mac) ou
